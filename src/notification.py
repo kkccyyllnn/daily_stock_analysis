@@ -145,12 +145,27 @@ class NotificationService:
 
         # 微信消息类型配置
         self._wechat_msg_type = getattr(config, 'wechat_msg_type', 'markdown')
-        # Telegram 配置
+               # Telegram 配置
         self._telegram_config = {
             'bot_token': getattr(config, 'telegram_bot_token', None),
-            'chat_id': getattr(config, 'telegram_chat_id', None),
             'message_thread_id': getattr(config, 'telegram_message_thread_id', None),
         }
+        
+        # 自動收集 telegram_chat_id, telegram_chat_id2 ... telegram_chat_id10
+        chat_ids = []
+        # 先抓第一個（沒有數字編號的）
+        first_id = getattr(config, 'telegram_chat_id', None)
+        if first_id:
+            chat_ids.append(first_id)
+            
+        # 再抓 2 到 10
+        for i in range(2, 11):
+            extra_id = getattr(config, f'telegram_chat_id{i}', None)
+            if extra_id:
+                chat_ids.append(extra_id)
+        
+        self._telegram_config['chat_ids'] = chat_ids  # 注意這裡改成了複數 chat_ids
+
         
         # 邮件配置
         self._email_config = {
@@ -1994,49 +2009,65 @@ class NotificationService:
     
     def send_to_telegram(self, content: str) -> bool:
         """
-        推送消息到 Telegram 机器人
-        
-        Telegram Bot API 格式：
-        POST https://api.telegram.org/bot<token>/sendMessage
-        {
-            "chat_id": "xxx",
-            "text": "消息内容",
-            "parse_mode": "Markdown"
-        }
-        
-        Args:
-            content: 消息内容（Markdown 格式）
-            
-        Returns:
-            是否发送成功
+        推送消息到 Telegram 机器人 (支援多個 Chat ID)
         """
         if not self._is_telegram_configured():
             logger.warning("Telegram 配置不完整，跳过推送")
             return False
         
         bot_token = self._telegram_config['bot_token']
-        chat_id = self._telegram_config['chat_id']
         message_thread_id = self._telegram_config.get('message_thread_id')
         
-        try:
-            # Telegram API 端点
-            api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        # 1. 收集所有可能的 Chat ID (從原始配置中抓取 telegram_chat_id 到 telegram_chat_id10)
+        chat_ids = []
+        # 獲取 config 物件 (假設 self._config 儲存了原始配置)
+        # 如果找不到 config 物件，則至少使用預設的 chat_id
+        main_id = self._telegram_config.get('chat_id')
+        if main_id:
+            chat_ids.append(main_id)
             
-            # Telegram 消息最大长度 4096 字符
+        # 嘗試從 config 屬性中動態獲取 chat_id2 ~ chat_id10
+        if hasattr(self, '_config'): # 確保能存取到 config
+            for i in range(2, 11):
+                extra_id = getattr(self._config, f'telegram_chat_id{i}', None)
+                if extra_id:
+                    chat_ids.append(extra_id)
+        
+        # 去重並移除空值
+        chat_ids = list(filter(None, list(set(chat_ids))))
+
+        if not chat_ids:
+            logger.warning("無效的 Telegram Chat ID，跳過推送")
+            return False
+
+        all_success = True
+        try:
+            api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             max_length = 4096
             
-            if len(content) <= max_length:
-                # 单条消息发送
-                return self._send_telegram_message(api_url, chat_id, content, message_thread_id)
-            else:
-                # 分段发送长消息
-                return self._send_telegram_chunked(api_url, chat_id, content, max_length, message_thread_id)
+            # 2. 循環發送給每個 Chat ID
+            for target_id in chat_ids:
+                logger.info(f"正在發送消息至 Telegram Chat ID: {target_id}")
+                success = False
+                if len(content) <= max_length:
+                    # 单条消息发送
+                    success = self._send_telegram_message(api_url, target_id, content, message_thread_id)
+                else:
+                    # 分段发送长消息
+                    success = self._send_telegram_chunked(api_url, target_id, content, max_length, message_thread_id)
+                
+                if not success:
+                    all_success = False
+                    logger.error(f"針對 ID {target_id} 的消息發送失敗")
+            
+            return all_success
                 
         except Exception as e:
-            logger.error(f"发送 Telegram 消息失败: {e}")
+            logger.error(f"发送 Telegram 消息过程发生异常: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             return False
+
     
     def _send_telegram_message(self, api_url: str, chat_id: str, text: str, message_thread_id: Optional[str] = None) -> bool:
         """发送单条 Telegram 消息"""
